@@ -95,14 +95,6 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
                              (self.get_system_root(), os.path.basename(bn)))
             pe.decoy_base = pe.get_base()
 
-            ep = pe.get_base() + pe.ep
-            drv.object.MajorFunction[ddk.IRP_MJ_CREATE] = ep + 1
-            drv.object.MajorFunction[ddk.IRP_MJ_READ] = ep + 2
-            drv.object.MajorFunction[ddk.IRP_MJ_WRITE] = ep + 3
-            drv.object.MajorFunction[ddk.IRP_MJ_DEVICE_CONTROL] = ep + 4
-            drv.object.MajorFunction[ddk.IRP_MJ_PNP] = ep + 5
-            drv.object.MajorFunction[ddk.IRP_MJ_INTERNAL_DEVICE_CONTROL] = ep+6
-
         else:
             if not name:
                 bn = pe.path
@@ -111,7 +103,8 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
                 pe.decoy_path = path
                 pe.decoy_base = pe.base
 
-        drv.init_driver_object(name, pe)
+        drv.init_driver_object(name, pe, is_decoy=False)
+
         self.add_object(drv)
 
         self.drivers.append(drv)
@@ -433,7 +426,7 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         dev.object.Characteristics = chars
         dev.object.DeviceType = devtype
         if ext_size > 0:
-            dev.object.DeviceObjectExtension = dev.address + dev.sizeof()
+            dev.object.DeviceExtension = dev.address + dev.sizeof()
 
         dev.write_back()
 
@@ -657,6 +650,9 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         self._set_entry_point_names()
         return super(WinKernelEmulator, self).get_json_report()
 
+    def get_ssdt_ptr(self):
+        return self.ssdt_ptr
+
     def setup_kernel_mode(self):
 
         idt = objman.IDT(self)
@@ -670,10 +666,10 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         ssdt = self.ktypes.SSDT(self.get_ptr_size())
         size = self.get_ptr_size() * 256
 
-        ptr = self.mem_map(size, base=None, tag='api.struct.SSDT')
+        self.ssdt_ptr = self.mem_map(size, base=None, tag='api.struct.SSDT')
         ssdt.NumberOfServices = 256
-        ssdt.pServiceTable = ptr + self.sizeof(ssdt)
-        self.mem_write(ptr, self.get_bytes(ssdt))
+        ssdt.pServiceTable = self.ssdt_ptr + self.sizeof(ssdt)
+        self.mem_write(self.ssdt_ptr, self.get_bytes(ssdt))
 
         self.get_sys_modules()
 

@@ -532,6 +532,22 @@ class AdvApi32(api.ApiHandler):
 
         return 0x1
 
+    @apihook('RevertToSelf', argc=0)
+    def RevertToSelf(self, emu, argv, ctx={}):
+        '''
+        BOOL RevertToSelf();
+        '''
+        return 1
+
+    @apihook('ImpersonateLoggedOnUser', argc=1)
+    def ImpersonateLoggedOnUser(self, emu, argv, ctx={}):
+        '''
+        BOOL ImpersonateLoggedOnUser(
+        HANDLE hToken
+        );
+        '''
+        return 1
+
     @apihook('OpenSCManager', argc=3)
     def OpenSCManager(self, emu, argv, ctx={}):
         '''
@@ -799,6 +815,7 @@ class AdvApi32(api.ApiHandler):
 
         user = emu.get_user()
         user_name = user.get('name')
+        argv[0] = user_name
 
         if lpBuffer:
             if cw == 2:
@@ -1020,7 +1037,7 @@ class AdvApi32(api.ApiHandler):
         }
 
         hProv, Algid, hKey, dwFlags, phHash = argv
-        argv[1] = hash_algs.get(Algid, Algid)
+        argv[1] = hash_algs.get(Algid, Algid)[0]
 
         if hKey != 0:
             return 0
@@ -1056,6 +1073,42 @@ class AdvApi32(api.ApiHandler):
 
         data = self.mem_read(pbData, dwDataLen)
         hnd.update(data)
+        return 1
+
+    @apihook('CryptGetHashParam', argc=5)
+    def CryptGetHashParam(self, emu, argv, ctx={}):
+        '''
+        BOOL CryptGetHashParam(
+          HCRYPTHASH hHash,
+          DWORD      dwParam,
+          BYTE       *pbData,
+          DWORD      *pdwDataLen,
+          DWORD      dwFlags
+        );
+        '''
+        hHash, dwParam, pbData, pdwDataLen, dwFlags = argv
+
+        param_enums = {
+            1: "HP_ALGID",
+            2: "HP_HASHVAL",
+            4: "HP_HASHSIZE",
+            5: "HP_HMAC_INFO"
+        }
+
+        if dwParam in param_enums.keys():
+            argv[1] = param_enums[dwParam]
+
+        return 1
+
+    @apihook('CryptDestroyHash', argc=1)
+    def CryptDestroyHash(self, emu, argv, ctx={}):
+        """
+        BOOL CryptDestroyHash(
+          HCRYPTHASH hHash
+        );
+        """
+        hHash = argv
+
         return 1
 
     @apihook('RegGetValue', argc=7, conv=_arch.CALL_CONV_STDCALL)
@@ -1118,3 +1171,31 @@ class AdvApi32(api.ApiHandler):
                                      buffer=lpData)
 
         return rv
+
+    @apihook('EnumServicesStatus', argc=8, conv=_arch.CALL_CONV_STDCALL)
+    def EnumServicesStatus(self, emu, argv, ctx={}):
+        '''
+        BOOL EnumServicesStatusA(
+          SC_HANDLE              hSCManager,
+          DWORD                  dwServiceType,
+          DWORD                  dwServiceState,
+          LPENUM_SERVICE_STATUSA lpServices,
+          DWORD                  cbBufSize,
+          LPDWORD                pcbBytesNeeded,
+          LPDWORD                lpServicesReturned,
+          LPDWORD                lpResumeHandle
+        );
+        '''
+        hSCManager, dwServiceType, dwServiceState, lpServices, cbBufSize, \
+            pcbBytesNeeded, lpServicesReturned, lpResumeHandle = argv
+
+        service_type_str = adv32.get_define_int(dwServiceType, 'SERVICE_')
+        if service_type_str:
+            argv[1] = service_type_str
+
+        service_state_str = adv32.get_define_int(dwServiceState, 'SERVICE_')
+        if service_state_str:
+            argv[2] = service_state_str
+
+        # TODO: Populate service status output
+        return 1

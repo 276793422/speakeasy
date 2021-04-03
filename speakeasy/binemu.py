@@ -4,6 +4,7 @@ import re
 import json
 import fnmatch
 import traceback
+from typing import List, Tuple, Dict
 
 import speakeasy.common as common
 import speakeasy.winenv.arch as e_arch
@@ -18,6 +19,9 @@ EMU_ENGINES = (
               ('unicorn', unicorn_eng.EmuEngine),
               )
 
+WILDCARD_FLAG = bool
+API_LEVEL = Tuple[Dict[str, List[common.ApiHook]], WILDCARD_FLAG]
+MODULE_LEVEL = Tuple[Dict[str, API_LEVEL], WILDCARD_FLAG]
 
 # Generic emulator class for binary code
 class BinaryEmulator(MemoryManager):
@@ -96,6 +100,7 @@ class BinaryEmulator(MemoryManager):
         self.osversion = config.get('os_ver', {})
         self.env = config.get('env', {})
         self.user_config = config.get('user', {})
+        self.domain = config.get('domain')
         self.hostname = config.get('hostname')
         self.symlinks = config.get('symlinks', [])
         self.config_modules = config.get('modules', {})
@@ -108,6 +113,7 @@ class BinaryEmulator(MemoryManager):
         self.timeout = config.get('timeout', 0)
         self.max_api_count = config.get('max_api_count', 5000)
         self.exceptions = config.get('exceptions', {})
+        self.drive_config = config.get('drives', [])
         self.filesystem_config = config.get('filesystem', {})
         self.keep_memory_on_free = config.get('keep_memory_on_free', False)
 
@@ -138,6 +144,12 @@ class BinaryEmulator(MemoryManager):
             if major is not None and minor is not None:
                 verstr = '%s.%d_%d' % (os_name, major, minor)
                 return verstr
+
+    def get_domain(self):
+        """
+        Get domain of the machine being emulated
+        """
+        return self.domain
 
     def get_hostname(self):
         """
@@ -197,6 +209,12 @@ class BinaryEmulator(MemoryManager):
         Get the filesystem settings specified in the filesystem section of the config file
         """
         return self.filesystem_config
+
+    def get_drive_config(self):
+        """
+        Get the drive settings specified in the drives section of the config file
+        """
+        return self.drive_config
 
     def reg_write(self, reg, val):
         """
@@ -487,17 +505,32 @@ class BinaryEmulator(MemoryManager):
         elif self.get_arch() == e_arch.ARCH_AMD64:
             self.reg_write(e_arch.AMD64_REG_RSP, addr)
 
+    def format_stack(self, num_ptrs):
+        """
+        Get the stack and format it for display
+        """
+        out = []
+        sp = self.get_stack_ptr()
+        for i in range(num_ptrs):
+            try:
+                ptr = self.mem_read(sp, self.get_ptr_size())
+            except Exception:
+                return out
+            ptr = int.from_bytes(ptr, 'little')
+            tag = self.get_address_tag(ptr)
+            out.append((sp, ptr, tag))
+            sp += self.get_ptr_size()
+        return out
+
     def print_stack(self, num_ptrs):
         """
         This a debug function used to print the current stack state
         """
-        sp = self.get_stack_ptr()
+        ptrs = self.format_stack(num_ptrs)
         print('Stack:')
         print('***********************')
-        for i in range(num_ptrs):
-            ptr = self.mem_read(sp, self.get_ptr_size())
-            ptr = int.from_bytes(ptr, 'little')
-            tag = self.get_address_tag(ptr)
+        for p in ptrs:
+            sp, ptr, tag = p
             if tag:
                 fmt = 'sp=0x%x:\t0x%x\t->\t%s' % (sp, ptr, tag)
             else:
@@ -694,10 +727,13 @@ class BinaryEmulator(MemoryManager):
         pat = b'[\x20-\x7f]{%d,}' % (min_len)
         res = re.compile(pat)
         hits = res.findall(data)
+        offset = 0
         for s in hits:
             try:
+                offset = data.find(s, offset)
                 s = s.decode('utf-8')
-                astrs.append(s)
+                astrs.append((offset, s))
+                offset += 1
             except UnicodeDecodeError:
                 continue
         return astrs
@@ -710,10 +746,13 @@ class BinaryEmulator(MemoryManager):
         pat = b'(?:[\x20-\x7f]\x00){%d,}' % (min_len)
         res = re.compile(pat)
         hits = res.findall(data)
+        offset = 0
         for ws in hits:
             try:
+                offset = data.find(ws, offset)
                 ws = ws.decode('utf-16le')
-                wstrs.append(ws)
+                wstrs.append((offset, ws))
+                offset += 1
             except UnicodeDecodeError:
                 continue
         return wstrs
@@ -790,59 +829,79 @@ class BinaryEmulator(MemoryManager):
                 return mod[0]
         return None
 
-    def get_api_hook(self, mod_name, func_name):
+    def get_api_hooks(self, mod_name, func_name) -> List[common.ApiHook]:
         """
         If an API hook has been set, return it here
         """
 
-        hooks = self.hooks.get(common.HOOK_API)
-        if not hooks:
-            return None
+        mod_name = mod_name.lower()
+        func_name = func_name.lower()
+        try:
+            hook_struct, wildcard_module = self.hooks[common.HOOK_API]
+        except KeyError:
+            return []
+        try:
+            modules = [hook_struct[mod_name]]
+        except KeyError:
+            modules = []
+        if wildcard_module:
+            for module_name_saved, value in hook_struct.items():
+                if fnmatch.fnmatch(mod_name, module_name_saved) and mod_name != module_name_saved:
+                    modules.append(value)
+        user_hooks = []
+        for module in modules:
+            hooks, wildcard_api = module
+            try:
+                user_hooks.extend(hooks[func_name])
+            except KeyError:
+                pass
+            if wildcard_api:
+                for func_name_saved, list_of_hooks in hooks.items():
+                    if fnmatch.fnmatch(func_name, func_name_saved) and func_name != func_name_saved:
+                        user_hooks.extend(list_of_hooks)
+        return user_hooks
 
-        # See if we can quickly resolve the api hook
-        quick_look, wild_list = hooks
-        api = (mod_name + '.' + func_name).lower()
-        qh = quick_look.get(api)
-        if qh:
-            return qh
-
-        # See if a wild card api hook was registered
-        for hook in wild_list:
-            if fnmatch.fnmatch(mod_name.lower(), hook.module.lower()):
-                if fnmatch.fnmatch(func_name.lower(), hook.api_name.lower()):
-                    return hook
-        return None
-
-    def add_api_hook(self, cb, module='', api_name='', argc=0, call_conv=None, emu=None,
-                     enable_wild_cards=True):
+    def add_api_hook(self, cb, module='', api_name='', argc=0, call_conv=None, emu=None) -> common.ApiHook:
         """
         Add an API level hook (e.g. kernel32.CreateFile) here
         """
+        module = module.lower()
+        api_name = api_name.lower()
 
-        contains_wild_cards = False
-        if enable_wild_cards:
-            for wc in ['?', '*', '[', ']']:
-                if wc in api_name:
-                    contains_wild_cards = True
-                    break
+        wildcard_module, wildcard_api = False, False
+        for wc in ['?', '*', '[', ']']:
+            if wc in module:
+                wildcard_module = True
+            if wc in api_name:
+                wildcard_api = True
 
         if not emu:
             emu = self
         hook = common.ApiHook(emu, self.emu_eng, cb, module, api_name, argc, call_conv)
-        _hooks = self.hooks.get(common.HOOK_API)
-        api = (module + '.' + api_name).lower()
+        _hooks: MODULE_LEVEL = self.hooks.get(common.HOOK_API)
+
+        api_dictionary = (
+            {
+              api_name: [hook]
+            },
+            wildcard_api)
         if not _hooks:
-            if not contains_wild_cards:
-                obj = ({api: hook}, [hook, ])
-            else:
-                obj = ({}, [hook, ])
-            self.hooks.update({common.HOOK_API: obj})
+            # First addition
+            obj = ({module: api_dictionary}, wildcard_module)
         else:
-            quick_look, wild_list = _hooks
-            if not contains_wild_cards:
-                quick_look.update({api: hook})
+            module_dict, previous_wildcard_module = _hooks
+            try:
+                api_dict, previous_wildcard_api = module_dict[module]
+            except KeyError:
+                # The module asked is not present, so we just add the api dictionary
+                module_dict[module] = api_dictionary
             else:
-                wild_list.append(hook)
+                # The module asked is present, so we can just add the hook
+                api_dict.setdefault(api_name, []).append(hook)
+                module_dict[module] = (api_dict, previous_wildcard_api | wildcard_api)
+            obj = (module_dict, previous_wildcard_module | wildcard_module)
+        self.hooks.update({common.HOOK_API: obj})
+        return hook
 
     def add_code_hook(self, cb, begin=1, end=0, ctx={}, emu=None):
         """
@@ -945,6 +1004,24 @@ class BinaryEmulator(MemoryManager):
 
         return hook
 
+    def add_mem_map_hook(self, cb, begin=1, end=0, emu=None):
+        """
+        Add a hook that will fire for memory maps
+        """
+        if not emu:
+            emu = self
+        hook = common.MapMemHook(emu, self.emu_eng, cb, begin, end)
+        hl = self.hooks.get(common.HOOK_MEM_MAP)
+        if not hl:
+            self.hooks.update({common.HOOK_MEM_MAP: [hook, ]})
+        else:
+            hl.insert(0, hook)
+
+        if self.emu_eng:
+            hook.add()
+
+        return hook
+
     def _hook_mem_invalid_dispatch(self, emu, access, address, size, value, ctx):
         """
         This handler will dispatch other invalid memory hooks
@@ -993,6 +1070,24 @@ class BinaryEmulator(MemoryManager):
         hl = self.hooks.get(common.HOOK_INTERRUPT)
         if not hl:
             self.hooks.update({common.HOOK_INTERRUPT: [hook, ]})
+        else:
+            hl.insert(0, hook)
+
+        if self.emu_eng:
+            hook.add()
+
+        return hook
+
+    def add_instruction_hook(self, cb, begin=1, end=0, ctx=[], emu=None, insn=None):
+        """
+        Add a hook that will fire for IN, SYSCALL, or SYSENTER instructions
+        """
+        if not emu:
+            emu = self
+        hook = common.InstructionHook(emu, self.emu_eng, cb, ctx=[], insn=insn)
+        hl = self.hooks.get(common.HOOK_INSN)
+        if not hl:
+            self.hooks.update({common.HOOK_INSN: [hook, ]})
         else:
             hl.insert(0, hook)
 

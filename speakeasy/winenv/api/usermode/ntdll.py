@@ -29,12 +29,6 @@ class Ntdll(api.ApiHandler):
 
         super(Ntdll, self).__get_hook_attrs__(self)
 
-    def normalize_dll_name(self, name):
-        ret = name
-        if (name.lower().startswith('api-ms-win-crt') or name.lower().startswith('vcruntime')):
-            ret = 'msvcrt'
-        return ret
-
     @apihook('RtlGetLastWin32Error', argc=0)
     def RtlGetLastWin32Error(self, emu, argv, ctx={}):
         '''DWORD RtlGetLastWin32Error();'''
@@ -178,3 +172,43 @@ class Ntdll(api.ApiHandler):
         dest, length = argv
         buf = b'\x00' * length
         self.mem_write(dest, buf)
+
+    @apihook('NtSetInformationProcess', argc=4)
+    def NtSetInformationProcess(self, emu, argv, ctx={}):
+        """
+        NTSTATUS
+        NTAPI
+        NtSetInformationProcess(
+            _In_ HANDLE ProcessHandle,
+            _In_ PROCESSINFOCLASS ProcessInformationClass,
+            _In_ PVOID ProcessInformation,
+            _In_ ULONG ProcessInformationLength
+        );
+        """
+        return 0
+
+    @apihook('RtlEncodePointer', argc=1)
+    def RtlEncodePointer(self, emu, argv, ctx={}):
+        '''
+        PVOID
+        NTAPI
+        RtlEncodePointer(IN PVOID Pointer)
+        '''
+        Ptr,  = argv
+        # Just increment the pointer for now like kernel32.EncodePointer
+        rv = Ptr + 1
+
+        return rv
+
+    @apihook('RtlDecodePointer', argc=1)
+    def RtlDecodePointer(self, emu, argv, ctx={}):
+        '''
+        PVOID
+        NTAPI
+        RtlDecodePointer(IN PVOID Pointer)
+        '''
+        Ptr,  = argv
+        # Just decrement the pointer for now like kernel32.DecodePointer
+        rv = Ptr - 1
+
+        return rv

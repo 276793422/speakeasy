@@ -158,6 +158,54 @@ class User32(api.ApiHandler):
 
         return 1
 
+    @apihook('SetCursorPos', argc=2)
+    def SetCursorPos(self, emu, argv, ctx={}):
+        '''
+        BOOL SetCursorPos(
+        int X,
+        int Y
+        );
+        '''
+        return 1
+
+    @apihook('CloseDesktop', argc=1)
+    def CloseDesktop(self, emu, argv, ctx={}):
+        '''
+        BOOL CloseDesktop(
+        HDESK hDesktop
+        );
+        '''
+        return 1
+
+    @apihook('CloseWindowStation', argc=1)
+    def CloseWindowStation(self, emu, argv, ctx={}):
+        '''
+        BOOL CloseWindowStation(
+        HWINSTA hWinSta
+        );
+        '''
+        return 1
+
+    @apihook('GetThreadDesktop', argc=1)
+    def GetThreadDesktop(self, emu, argv, ctx={}):
+        '''
+        HDESK GetThreadDesktop(
+        DWORD dwThreadId
+        );
+        '''
+        return 1
+
+    @apihook('OpenWindowStation', argc=3)
+    def OpenWindowStation(self, emu, argv, ctx={}):
+        '''
+        HWINSTA OpenWindowStation(
+        LPCSTR      lpszWinSta,
+        BOOL        fInherit,
+        ACCESS_MASK dwDesiredAccess
+        );
+        '''
+        return 1
+
     @apihook('ChangeWindowMessageFilter', argc=2)
     def ChangeWindowMessageFilter(self, emu, argv, ctx={}):
         '''
@@ -661,6 +709,7 @@ class User32(api.ApiHandler):
         self.write_string(fin, buf)
         argv.clear()
         argv.append(fin)
+        argv.append(fmt_str)
         return len(fin)
 
     @apihook('ReleaseDC', argc=2)
@@ -1170,3 +1219,19 @@ class User32(api.ApiHandler):
         );
         """
         return 0
+
+    @apihook('GetKeyboardLayoutList', argc=2)
+    def GetKeyboardLayoutList(self, emu, argv, ctx={}):
+        """
+        int GetKeyboardLayoutList(
+          int nBuff,
+          HKL *lpList
+        );
+        """
+        nBuff, lpList = argv
+
+        locale = 0x409      # English - United States
+        self.mem_write(lpList, locale.to_bytes(2, 'little'))
+        self.mem_write(lpList + 4, locale.to_bytes(2, 'little'))
+
+        return 1

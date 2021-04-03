@@ -67,21 +67,7 @@ class Ntoskrnl(api.ApiHandler):
     @impdata('KeServiceDescriptorTable')
     def KeServiceDescriptorTable(self, ptr=0):
         """Kernel table containing SSDT"""
-        ssdt = self.win.SSDT(self.emu.get_ptr_size())
-        size = self.sizeof(ssdt)
-        size += (self.get_ptr_size() * 256)
-        desc_tbl = ptr
-
-        if not ptr:
-            desc_tbl = self.mem_alloc(size, base=None,
-                                      tag='emu.struct.SSDT')
-
-        ssdt.NumberOfServices = 256
-        ssdt.pServiceTable = desc_tbl + self.sizeof(ssdt)
-
-        self.mem_write(desc_tbl, self.get_bytes(ssdt))
-
-        return desc_tbl
+        return self.emu.get_ssdt_ptr()
 
     @impdata('KdDebuggerEnabled')
     def KdDebuggerEnabled(self, ptr=0):
@@ -374,6 +360,15 @@ class Ntoskrnl(api.ApiHandler):
         self.mem_write(dest, data)
         return dest
 
+    @apihook('IoDeleteDriver', argc=1)
+    def IoDeleteDriver(self, emu, argv, ctx={}):
+        """
+        VOID IoDeleteDriver(PDRIVER_OBJECT DriverObject)
+        """
+        drv, = argv
+
+        return
+
     @apihook('IoCreateDevice', argc=7)
     def IoCreateDevice(self, emu, argv, ctx={}):
         """
@@ -395,6 +390,8 @@ class Ntoskrnl(api.ApiHandler):
             name = self.read_unicode_string(name).replace('\x00', '')
 
         driver_obj = self.get_object_from_addr(drv)
+        if not driver_obj:
+            return ddk.STATUS_INVALID_PARAMETER
 
         dev = emu.create_device_object(name, driver_obj, ext_size, devtype,
                                        chars, tag='api.object')
@@ -1738,6 +1735,23 @@ class Ntoskrnl(api.ApiHandler):
         int_sys_time = int.from_bytes(sys_time, 'little')
         self.mem_write(LocalTime, int_sys_time.to_bytes(8, 'little'))
 
+    @apihook('CmRegisterCallbackEx', argc=6)
+    def CmRegisterCallbackEx(self, emu, argv, ctx={}):
+        """
+        NTSTATUS CmRegisterCallbackEx(
+            PEX_CALLBACK_FUNCTION Function,
+            PCUNICODE_STRING      Altitude,
+            PVOID                 Driver,
+            PVOID                 Context,
+            PLARGE_INTEGER        Cookie,
+            PVOID                 Reserved
+        );
+        """
+        # TODO: Emulate the callback routine
+        rv = ddk.STATUS_SUCCESS
+
+        return rv
+
     @apihook('CmRegisterCallback', argc=3)
     def CmRegisterCallback(self, emu, argv, ctx={}):
         """
@@ -3007,6 +3021,7 @@ class Ntoskrnl(api.ApiHandler):
             size = int.from_bytes(size, 'little')
         hmap = fm.file_create_mapping(FileHandle, name, size, SectionPageProtection)
         self.mem_write(SectionHandle, hmap.to_bytes(self.get_ptr_size(), byteorder='little'))
+        argv[0] = hmap
 
         return ddk.STATUS_SUCCESS
 
@@ -3084,8 +3099,10 @@ class Ntoskrnl(api.ApiHandler):
                 fname = fname.replace('.', '_')
                 mm.update_tag('%s.%s.0x%x' % (tag_prefix, fname, buf))
                 self.mem_write(buf, data)
+                if ViewSize:
+                    self.mem_write(ViewSize, size.to_bytes(self.get_ptr_size(), 'little'))
                 argv[2] = buf
-                argv[3] = size
+                argv[6] = size
             elif not pref_address:
                 if bytes_to_map == 0:
                     bytes_to_map = sect.size
@@ -3094,8 +3111,10 @@ class Ntoskrnl(api.ApiHandler):
                                      process=proc_obj)
                 mm = emu.get_address_map(buf)
                 mm.update_tag('%s.0x%x' % (tag_prefix, buf))
+                if ViewSize:
+                    self.mem_write(ViewSize, size.to_bytes(self.get_ptr_size(), 'little'))
                 argv[2] = buf
-                argv[3] = size
+                argv[6] = size
                 sect.add_view(buf, full_offset, size, access)
             else:
                 buf = pref_address

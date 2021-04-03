@@ -52,6 +52,7 @@ class Speakeasy(object):
         self.mem_write_hooks = []
         self.mem_invalid_hooks = []
         self.interrupt_hooks = []
+        self.mem_map_hooks = []
 
     def __enter__(self):
         return self
@@ -142,6 +143,9 @@ class Speakeasy(object):
             h = self.interrupt_hooks.pop(0)
             cb, ctx = h
             self.add_interrupt_hook(cb, ctx)
+        while self.mem_map_hooks:
+            h = self.mem_map_hooks.pop(0)
+            self.add_mem_map_hook(h)
 
     def disasm(self, addr: int, size: int, fast=True):
         """
@@ -153,7 +157,10 @@ class Speakeasy(object):
         return:
             A tuple of: (mnemonic, operands, and the full instruction)
         """
-        return self.emu.get_disasm(addr, size, fast)
+        try:
+            return self.emu.get_disasm(addr, size, fast)
+        except Exception:
+            raise SpeakeasyError("Failed to disassemble at address: 0x%x" % (addr))
 
     def is_pe(self, data: bytes) -> bool:
         """
@@ -265,7 +272,7 @@ class Speakeasy(object):
         """
         return self.emu.get_json_report()
 
-    def add_api_hook(self, cb: Callable, module='', api_name='', argc=0, call_conv=None, enable_wild_cards=True):
+    def add_api_hook(self, cb: Callable, module='', api_name='', argc=0, call_conv=None):
         """
         Set a callback to fire when a specified API is called during emulation
 
@@ -275,7 +282,6 @@ class Speakeasy(object):
             api_name: Name of the API to hook. Wild cards (e.g. *) are supported.
             argc: force the emulator to account for this amount of arguments (for stack cleanup)
             call_conv: force the emulator to use the supplied calling convention for this hook
-            enable_wild_cards: enable wild cards for this hook
         return:
             Hook object for newly registered hooks
         """
@@ -283,7 +289,7 @@ class Speakeasy(object):
             self.api_hooks.append((cb, module, api_name, argc, call_conv))
             return
         return self.emu.add_api_hook(cb, module=module, api_name=api_name, argc=argc,
-                                     call_conv=call_conv, emu=self, enable_wild_cards=enable_wild_cards)
+                                     call_conv=call_conv, emu=self)
 
     def resume(self, addr, count=-1):
         """
@@ -295,6 +301,7 @@ class Speakeasy(object):
         return:
             None
         """
+        self.emu.run_complete = False
         self.emu.resume(addr, count=count)
 
     def stop(self) -> None:
@@ -364,6 +371,38 @@ class Speakeasy(object):
             return
         return self.emu.add_mem_write_hook(cb, begin=begin, end=end, emu=self)
 
+    def add_IN_instruction_hook(self, cb: Callable, begin=1, end=0):
+        """
+        Set a callback to fire when an IN instruction executes
+
+        args:
+            cb: Callable python function to execute
+            begin: beginning of the address range to hook
+            end: end of the address range to hook
+        return:
+            Hook object for newly registered hooks
+        """
+        if not self.emu:
+            self.mem_write_hooks.append((cb, begin, end))
+            return
+        return self.emu.add_instruction_hook(cb, begin=begin, end=end, emu=self, insn=218)
+
+    def add_SYSCALL_instruction_hook(self, cb: Callable, begin=1, end=0):
+        """
+        Set a callback to fire when a SYSCALL / SYSENTER instruction executes
+
+        args:
+            cb: Callable python function to execute
+            begin: beginning of the address range to hook
+            end: end of the address range to hook
+        return:
+            Hook object for newly registered hooks
+        """
+        if not self.emu:
+            self.mem_write_hooks.append((cb, begin, end))
+            return
+        return self.emu.add_instruction_hook(cb, begin=begin, end=end, emu=self, insn=700)
+
     def add_mem_invalid_hook(self, cb: Callable):
         """
         Get a callback for when a memory access violation occurs
@@ -416,6 +455,24 @@ class Speakeasy(object):
         """
         return self.emu.get_address_map(addr)
 
+    def get_user_modules(self) -> list:
+        """
+        Get the address ranges of loaded user modules
+
+        return:
+            List of all currently loaded user modules
+        """
+        return self.emu.get_user_modules()
+
+    def get_sys_modules(self) -> list:
+        """
+        Get the address ranges of loaded system modules
+
+        return:
+            List of all currently loaded system modules
+        """
+        return self.emu.get_sys_modules()
+
     def mem_alloc(self, size, base=None, tag='speakeasy.None') -> int:
         """
         Allocate a block of memory in the emulation space
@@ -450,7 +507,10 @@ class Speakeasy(object):
         return:
             Python bytes object contained the data read
         """
-        return self.emu.mem_read(addr, size)
+        try:
+            return self.emu.mem_read(addr, size)
+        except Exception:
+            raise SpeakeasyError("Failed to read %d bytes at address: 0x%x" % (size, addr))
 
     def mem_write(self, addr: int, data: bytes) -> None:
         """
@@ -462,7 +522,10 @@ class Speakeasy(object):
         return:
             None
         """
-        return self.emu.mem_write(addr, data)
+        try:
+            return self.emu.mem_write(addr, data)
+        except Exception:
+            raise SpeakeasyError("Failed to write %d bytes at address: 0x%x" % (len(data), addr))
 
     def mem_cast(self, obj, addr: int):
         """
@@ -699,6 +762,15 @@ class Speakeasy(object):
         """
         return self.emu.ptr_size
 
+    def get_all_registers(self) -> dict:
+        """
+        Get the state of all registers
+
+        return:
+            Dict containing emulation register states
+        """
+        return self.emu.get_register_state()
+
     def get_symbol_from_address(self, address: int) -> str:
         """
         If the supplied address is related to a known symbol, look it up here
@@ -722,6 +794,22 @@ class Speakeasy(object):
             True if address is valid, false otherwise
         """
         return self.emu.is_address_valid(address)
+
+    def add_mem_map_hook(self, cb: Callable, begin=1, end=0):
+        """
+        Set a callback to fire when a memory address is mapped
+
+        args:
+            cb: Callable python function to execute
+            begin: beginning of the address range to hook
+            end: end of the address range to hook
+        return:
+            Hook object for newly registered hooks
+        """
+        if not self.emu:
+            self.mem_map_hooks.append((cb, begin, end))
+            return
+        return self.emu.add_mem_map_hook(cb, begin=begin, end=end, emu=self)
 
     def create_memdump_archive(self) -> bytes:
         """

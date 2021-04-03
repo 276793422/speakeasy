@@ -17,6 +17,7 @@ from speakeasy.windows.fileman import FileManager
 from speakeasy.windows.cryptman import CryptoManager
 from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.hammer import ApiHammer
+from speakeasy.windows.driveman import DriveManager
 
 import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.windows.windows as windef
@@ -99,6 +100,7 @@ class WindowsEmulator(BinaryEmulator):
         self.regman = RegistryManager(self.get_registry_config())
         self.fileman = FileManager(self.get_filesystem_config())
         self.netman = NetworkManager(config=self.get_network_config())
+        self.driveman = DriveManager(config=self.get_drive_config())
         self.cryptman = CryptoManager()
         self.hammer = ApiHammer(self)
 
@@ -253,6 +255,12 @@ class WindowsEmulator(BinaryEmulator):
         Get the crypto manager
         """
         return self.cryptman
+
+    def get_drive_manager(self):
+        """
+        Get the drive manager
+        """
+        return self.driveman
 
     def reg_open_key(self, path, create=False):
         """
@@ -1026,16 +1034,10 @@ class WindowsEmulator(BinaryEmulator):
                 name = 'Zw' + name[2:]
                 alt_imp_api = 'Zw%s' % (name[2:])
 
-        # Funnel CRTs into a single handler
-        if (dll.lower().startswith(('api-ms-win-crt', 'vcruntime', 'ucrtbased'))):
-            alt_imp_dll = 'msvcrt'
-
-        # Redirect windows sockets 1.0 to windows sockets 2.0
-        if (dll.lower().startswith('winsock') or dll.lower().startswith('wsock32')):
-            alt_imp_dll = 'ws2_32'
+        alt_imp_dll = winemu.normalize_dll_name(dll)
 
         # Bridge ntdll funcs to ntoskrnl if supported
-        elif dll.lower().startswith('ntdll'):
+        if dll.lower().startswith('ntdll'):
             alt_imp_dll = 'ntoskrnl'
             mod, func_attrs = self.api.get_export_func_handler(alt_imp_dll,
                                                                name)
@@ -1110,12 +1112,14 @@ class WindowsEmulator(BinaryEmulator):
             default_ctx = {'func_name': imp_api}
 
             self.hammer.handle_import_func(imp_api, conv, argc)
-            hook = self.get_api_hook(dll, name)
-            if hook:
+            hooks = self.get_api_hooks(dll, name)
+            if hooks:
                 from types import MethodType
                 hooked_func = MethodType(func, mod)
                 orig = lambda args: hooked_func(self, args, default_ctx) # noqa
-                rv = hook.cb(self, imp_api, orig, argv)
+                for hook in hooks:
+                    # each hook is called with the arguments, and only the last return value is considered
+                    rv = hook.cb(self, imp_api, orig, argv)
             else:
                 try:
                     rv = self.api.call_api_func(mod, func, argv, ctx=default_ctx)
@@ -1143,8 +1147,10 @@ class WindowsEmulator(BinaryEmulator):
 
         else:
             # See if a user defined a hook for this unsupported function
-            hook = self.get_api_hook(dll, name)
-            if hook:
+            hooks = self.get_api_hooks(dll, name)
+            if hooks:
+                # Since the function is unsupported, just call the most accurate defined hook
+                hook = hooks[0]
                 imp_api = '%s.%s' % (dll, name)
 
                 if hook.call_conv is None:
@@ -1426,6 +1432,11 @@ class WindowsEmulator(BinaryEmulator):
         """
         Called when non-writable address is written to
         """
+        # ignore patches to APIs
+        if address >= winemu.EMU_RESERVED and \
+                address <= (winemu.EMU_RESERVED + winemu.EMU_RESERVE_SIZE):
+            return True
+
         if self.dispatch_handlers:
             rv = self.dispatch_seh(ddk.STATUS_ACCESS_VIOLATION, address)
             if rv:
@@ -1623,7 +1634,7 @@ class WindowsEmulator(BinaryEmulator):
             jit = winemu.JitPeFile(self.get_arch())
 
             funcs = [(f[4], f[0]) for k, f in mod_handler.funcs.items() if isinstance(k, str)]
-
+            data_exports = [k for k, d in mod_handler.data.items() if isinstance(k, str)]
             new = funcs.copy()
 
             if modname == 'ntdll':
@@ -1645,6 +1656,7 @@ class WindowsEmulator(BinaryEmulator):
             func_names = new
 
             func_names = [fn for o, fn in func_names]
+            func_names.sort()
 
             exports = []
             ords = [o for o, fn in funcs if o is not None]
@@ -1665,8 +1677,9 @@ class WindowsEmulator(BinaryEmulator):
             if not exports:
                 exports = func_names
 
+            exports += data_exports
             img = jit.get_decoy_pe_image(modname, exports)
-            mod = winemu.DecoyModule(data=img)
+            mod = winemu.DecoyModule(data=img, is_jitted=True)
 
             return mod
         return None
@@ -1690,7 +1703,7 @@ class WindowsEmulator(BinaryEmulator):
         for img in images:
             arch = img['arch']
             if arch == self.get_arch():
-                path = img['path']
+                path = self.get_native_module_path(mod_name=img['name'])
 
         if not path:
             path = default_file_path
@@ -1746,7 +1759,6 @@ class WindowsEmulator(BinaryEmulator):
         parse a PE's export table while resolving exported functions
         """
         if not decoy.is_mapped:
-
             decoy.full_load()
 
             for exp in decoy.get_exports():
@@ -1918,6 +1930,12 @@ class WindowsEmulator(BinaryEmulator):
             self.set_pc(entry.Handler)
             return True
         return False
+
+    def get_reserved_ranges(self):
+        """
+        Get the allocated memory ranges that the emulator reserves
+        """
+        return (winemu.EMU_RESERVED, winemu.EMU_RESERVED_END)
 
     def _continue_seh_x86(self):
         """

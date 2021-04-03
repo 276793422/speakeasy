@@ -2,6 +2,7 @@
 
 import os
 import ntpath
+import string
 import fnmatch
 import datetime
 import ctypes as ct
@@ -9,6 +10,7 @@ import ctypes as ct
 import speakeasy.winenv.arch as e_arch
 import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.common as common
+import speakeasy.windows.common as winemu
 from speakeasy.errors import ApiEmuError
 import speakeasy.winenv.defs.windows.windows as windefs
 import speakeasy.winenv.defs.windows.kernel32 as k32types
@@ -36,6 +38,7 @@ class Kernel32(api.ApiHandler):
         self.heaps = []
         self.curr_handle = 0x1800
         self.find_files = {}
+        self.find_volumes = {}
         self.snapshots = {}
         self.find_resources = {}
         self.tick_counter = 86400000  # 1 day in millisecs
@@ -90,14 +93,6 @@ class Kernel32(api.ApiHandler):
             if (emu_perms & common.PERM_MEM_WRITE):
                 new |= windefs.PAGE_READWRITE
         return new
-
-    def normalize_dll_name(self, name):
-        ret = name
-        if (name.lower().startswith('api-ms-win-crt') or name.lower().startswith('vcruntime')):
-            ret = 'msvcrt'
-        if (name.lower().startswith('api-ms-win-core')):
-            ret = 'kernel32'
-        return ret
 
     def normalize_res_identifier(self, emu, cw, val):
         mask = (16 ** (emu.get_ptr_size() // 2) - 1) << 16
@@ -292,7 +287,7 @@ class Kernel32(api.ApiHandler):
 
         cw = self.get_char_width(ctx)
         req_lib = self.read_mem_string(lib_name, cw)
-        lib = self.normalize_dll_name(req_lib)
+        lib = winemu.normalize_dll_name(req_lib)
 
         hmod = emu.load_library(lib)
         argv[0] = req_lib
@@ -314,6 +309,19 @@ class Kernel32(api.ApiHandler):
             hnd = self.get_handle()
             index = 0
             self.snapshots.update({hnd: [index, emu.get_processes()]})
+        elif k32types.TH32CS_SNAPTHREAD == dwFlags:
+            hnd = self.get_handle()
+            index = 0
+            if th32ProcessID in [0, emu.curr_process.get_pid()]:
+                proc = emu.curr_process
+            else:
+                for p in emu.get_processes():
+                    if th32ProcessID == p.get_pid():
+                        proc = p
+                        break
+                else:
+                    raise ApiEmuError('The specified PID not found')
+            self.snapshots.update({hnd: [index, proc.threads, proc.get_pid()]})
         else:
             raise ApiEmuError('Unsupported snapshot type: 0x%x' % (dwFlags))
 
@@ -397,6 +405,66 @@ class Kernel32(api.ApiHandler):
             pe.szExeFile = proc.image.encode('utf-8') + b'\x00'
 
         self.mem_write(pe32, self.get_bytes(data))
+        rv = True
+        return rv
+
+    @apihook('Thread32First', argc=2)
+    def Thread32First(self, emu, argv, ctx={}):
+        '''
+        BOOL Thread32First(
+        HANDLE          hSnapshot,
+        LPTHREADENTRY32 lpte
+        );
+        '''
+
+        hSnapshot, te32, = argv
+        rv = False
+
+        snap = self.snapshots.get(hSnapshot)
+        if not snap or not te32:
+            return rv
+
+        # Reset the handle index
+        snap[0] = 1
+        thread = snap[1][0]
+
+        te = self.k32types.THREADENTRY32(emu.get_ptr_size())
+        data = self.mem_cast(te, te32)
+        te.th32ThreadID = thread.tid
+        te.th32OwnerProcessID = snap[2]
+
+        self.mem_write(te32, self.get_bytes(data))
+        rv = True
+        return rv
+
+    @apihook('Thread32Next', argc=2)
+    def Thread32Next(self, emu, argv, ctx={}):
+        '''
+        BOOL Thread32Next(
+        HANDLE          hSnapshot,
+        LPTHREADENTRY32 lpte
+        );
+        '''
+
+        hSnapshot, te32, = argv
+        rv = False
+
+        snap = self.snapshots.get(hSnapshot)
+        if not snap or not te32:
+            return rv
+
+        index = snap[0]
+        snap[0] += 1
+        if index >= len(snap[1]):
+            return rv
+        thread = snap[1][index]
+
+        te = self.k32types.THREADENTRY32(emu.get_ptr_size())
+        data = self.mem_cast(te, te32)
+        te.th32ThreadID = thread.tid
+        te.th32OwnerProcessID = snap[2]
+
+        self.mem_write(te32, self.get_bytes(data))
         rv = True
         return rv
 
@@ -523,7 +591,7 @@ class Kernel32(api.ApiHandler):
 
         cw = self.get_char_width(ctx)
         req_lib = self.read_mem_string(lib_name, cw)
-        lib = self.normalize_dll_name(req_lib)
+        lib = winemu.normalize_dll_name(req_lib)
 
         hmod = emu.load_library(lib)
 
@@ -1157,6 +1225,35 @@ class Kernel32(api.ApiHandler):
 
         return None
 
+    @apihook('SetHandleInformation', argc=3)
+    def SetHandleInformation(self, emu, argv, ctx={}):
+        '''
+        BOOL SetHandleInformation(
+          HANDLE hObject,
+          DWORD  dwMask,
+          DWORD  dwFlags
+        );
+        '''
+
+        # Non-zero value for success.
+        rv = 1
+
+        return rv
+
+    @apihook('GetHandleInformation', argc=2)
+    def GetHandleInformation(self, emu, argv, ctx={}):
+        '''
+        BOOL GetHandleInformation(
+          HANDLE  hObject,
+          LPDWORD lpdwFlags
+        );
+        '''
+
+        # Non-zero value for success.
+        rv = 1
+
+        return rv
+
     @apihook('ExitProcess', argc=1)
     def ExitProcess(self, emu, argv, ctx={}):
         '''void ExitProcess(
@@ -1194,7 +1291,7 @@ class Kernel32(api.ApiHandler):
 
         quad = (ft.dwHighDateTime << 32) | ft.dwLowDateTime
         try:
-            dt = datetime.utcfromtimestamp((quad - 116444736000000000) / 10000000)
+            dt = datetime.datetime.utcfromtimestamp((quad - 116444736000000000) / 10000000)
         except ValueError:
             dt = None
 
@@ -1206,13 +1303,10 @@ class Kernel32(api.ApiHandler):
             st.wHour = dt.hour
             st.wMinute = dt.minute
             st.wSecond = dt.second
-            rv = True
             if lpSystemTime:
                 self.mem_write(lpSystemTime, st.get_bytes())
-        else:
-            rv = True
 
-        return rv
+        return True
 
     @apihook('GetSystemTimeAsFileTime', argc=1)
     def GetSystemTimeAsFileTime(self, emu, argv, ctx={}):
@@ -1394,6 +1488,28 @@ class Kernel32(api.ApiHandler):
 
         return rv
 
+    @apihook('lstrcmp', argc=2)
+    def lstrcmp(self, emu, argv, ctx={}):
+        '''int lstrcmpiA(
+          LPCSTR lpString1,
+          LPCSTR lpString2
+        );'''
+        cw = self.get_char_width(ctx)
+
+        string1, string2 = argv
+        rv = 1
+
+        cs1 = self.read_mem_string(string1, cw)
+        cs2 = self.read_mem_string(string2, cw)
+
+        argv[0] = cs1
+        argv[1] = cs2
+
+        if cs1 == cs2:
+            rv = 0
+
+        return rv
+
     @apihook('QueryPerformanceCounter', argc=1)
     def QueryPerformanceCounter(self, emu, argv, ctx={}):
         '''BOOL WINAPI QueryPerformanceCounter(
@@ -1454,19 +1570,20 @@ class Kernel32(api.ApiHandler):
         rv = 0
 
         if not mod_name:
-
             proc = emu.get_current_process()
             rv = proc.base
         else:
             lib = self.read_mem_string(mod_name, cw)
             argv[0] = lib
             sname, _ = os.path.splitext(lib)
+            sname = winemu.normalize_dll_name(sname)
             mods = emu.get_user_modules()
             for mod in mods:
                 img = ntpath.basename(mod.get_emu_path())
                 fname, _ = os.path.splitext(img)
                 if fname.lower() == sname.lower():
                     rv = mod.get_base()
+                    break
 
         return rv
 
@@ -1515,6 +1632,14 @@ class Kernel32(api.ApiHandler):
     def Sleep(self, emu, argv, ctx={}):
         '''void Sleep(DWORD dwMilliseconds);'''
         millisec, = argv
+
+        return
+
+    @apihook('SleepEx', argc=2)
+    def SleepEx(self, emu, argv, ctx={}):
+        '''DWORD SleepEx(DWORD dwMilliseconds, BOOL bAlertable);
+        '''
+        millisec, bAlertable = argv
 
         return
 
@@ -2651,22 +2776,23 @@ class Kernel32(api.ApiHandler):
         cw = self.get_char_width(ctx)
         fn = ctx['func_name']
         if 'GetWindowsDirectory' in fn:
-            sysroot = emu.get_windows_dir()
+            sysroot = 'C:\\Windows'
         else:
-            sysroot = emu.get_system_root()
-        if sysroot:
-            sysroot += '\x00'
-            if cw == 2:
-                out = sysroot.encode('utf-16le')
-            elif cw == 1:
-                out = sysroot.encode('utf-8')
+            sysroot = 'C:\\Windows\\system32'
 
-            if len(sysroot) > uSize:
-                emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
-            else:
-                self.mem_write(lpBuffer, out)
-                emu.set_last_error(windefs.ERROR_SUCCESS)
-                rv = len(sysroot)
+        argv[0] = sysroot
+        sysroot += '\x00'
+        if cw == 2:
+            out = sysroot.encode('utf-16le')
+        elif cw == 1:
+            out = sysroot.encode('utf-8')
+
+        if len(sysroot) > uSize:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+        else:
+            self.mem_write(lpBuffer, out)
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+            rv = len(sysroot)
 
         return rv
 
@@ -2861,6 +2987,59 @@ class Kernel32(api.ApiHandler):
         if self.does_file_exist(target):
             rv = windefs.FILE_ATTRIBUTE_NORMAL
         return rv
+
+    @apihook('GetFileAttributesEx', argc=3)
+    def GetFileAttributesEx(self, emu, argv, ctx={}):
+        '''
+        BOOL GetFileAttributesEx(
+          LPCSTR                 lpFileName,
+          GET_FILEEX_INFO_LEVELS fInfoLevelId,
+          LPVOID                 lpFileInformation
+        );
+        '''
+        lpFileName, fInfoLevelId, lpFileInformation = argv
+
+        cw = self.get_char_width(ctx)
+
+        filename = self.read_mem_string(lpFileName, cw)
+        argv[0] = filename
+
+        level_id = k32types.get_define(fInfoLevelId, 'GetFileExInfo')
+        if not level_id:
+            return False
+
+        argv[1] = level_id
+
+        file_data = k32types.WIN32_FILE_ATTRIBUTE_DATA(emu.get_ptr_size())
+
+        # Set WIN32_FILE_ATTRIBUTE_DATA.dwFileAttributes to Normal
+        file_data.dwFileAttributes = k32types.FILE_ATTRIBUTE_NORMAL
+
+        # Set WIN32_FILE_ATTRIBUTE_DATA.ftCreationTime + .ftLastAccessTime + .ftLastWriteTime, using current date time
+        timestamp = 116444736000000000 + int(datetime.datetime.utcnow().timestamp()) * 10000000
+        file_data.ftCreationTime.dwLowDateTime = 0xFFFFFFFF & timestamp
+        file_data.ftCreationTime.dwHighDateTime = timestamp >> 32
+
+        # Set WIN32_FILE_ATTRIBUTE_DATA.nFileSizeHigh + .nFileSizeLow
+        fHandle = self.file_open(filename)
+        if fHandle:
+            full_size = fHandle.get_size()
+            high = (0xFFFFFFFF & (full_size >> 32))
+            low = 0xFFFFFFFF & full_size
+            high = high.to_bytes(4, 'little')
+
+            if file_data.nFileSizeHigh:
+                file_data.ftCreationTime.nFileSizeHigh = high
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+
+        else:
+            low = 0xFFFFFFFF
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+
+        file_data.ftCreationTime.nFileSizeLow = low
+
+        self.mem_write(lpFileInformation, file_data.get_bytes())
+        return True
 
     @apihook('CreateDirectory', argc=2)
     def CreateDirectory(self, emu, argv, ctx={}):
@@ -3541,6 +3720,39 @@ class Kernel32(api.ApiHandler):
             hnd = windefs.INVALID_HANDLE_VALUE
         return hnd
 
+    @apihook('CreatePipe', argc=4)
+    def CreatePipe(self, emu, argv, ctx={}):
+        '''
+        BOOL CreatePipe(
+        PHANDLE               hReadPipe,
+        PHANDLE               hWritePipe,
+        LPSECURITY_ATTRIBUTES lpPipeAttributes,
+        DWORD                 nSize
+        );
+        '''
+        hReadPipe, hWritePipe, lpPipeAttributes, nSize = argv
+
+        hnd = emu.pipe_open('', 0, 1, nSize, nSize)
+        if not hnd:
+            hnd = windefs.INVALID_HANDLE_VALUE
+        return hnd
+
+    @apihook('PeekNamedPipe', argc=6)
+    def PeekNamedPipe(self, emu, argv, ctx={}):
+        '''
+        BOOL PeekNamedPipe(
+        HANDLE  hNamedPipe,
+        LPVOID  lpBuffer,
+        DWORD   nBufferSize,
+        LPDWORD lpBytesRead,
+        LPDWORD lpTotalBytesAvail,
+        LPDWORD lpBytesLeftThisMessage
+        );
+        '''
+        (hNamedPipe, lpBuffer, nBufferSize, lpBytesRead,
+         lpTotalBytesAvail, lpBytesLeftThisMessage) = argv
+        return True
+
     @apihook('ConnectNamedPipe', argc=2)
     def ConnectNamedPipe(self, emu, argv, ctx={}):
         '''
@@ -3641,10 +3853,10 @@ class Kernel32(api.ApiHandler):
     @apihook('GetComputerName', argc=2)
     def GetComputerName(self, emu, argv, ctx={}):
         '''
-    BOOL GetComputerName(
-        LPSTR   lpBuffer,
-        LPDWORD nSize
-    );
+        BOOL GetComputerName(
+            LPSTR   lpBuffer,
+            LPDWORD nSize
+        );
         '''
 
         lpBuffer, nSize = argv
@@ -3652,6 +3864,8 @@ class Kernel32(api.ApiHandler):
         cw = self.get_char_width(ctx)
 
         host = emu.get_hostname()
+        argv[0] = host
+        argv[1] = len(host)
 
         if lpBuffer and host:
             if cw == 2:
@@ -3778,6 +3992,8 @@ class Kernel32(api.ApiHandler):
 
         srch = self.read_mem_string(lpFileName, cw)
         argv[0] = srch
+        if srch.startswith('\\\\?\\'):
+            srch = srch.replace('\\\\?\\', '')
 
         fm = emu.get_file_manager()
         fw = fm.walk_files()
@@ -4254,16 +4470,24 @@ class Kernel32(api.ApiHandler):
     def GetDriveType(self, emu, argv, ctx={}):
         '''
         UINT GetDriveType(
-        LPCSTR lpRootPathName
+          LPCSTR lpRootPathName
         );
         '''
         lpRootPathName, = argv
-        DRIVE_FIXED = 3
+
         cw = self.get_char_width(ctx)
         name = self.read_mem_string(lpRootPathName, cw)
-        argv[0] = name
+        if name:
+            argv[0] = name
 
-        return DRIVE_FIXED
+        if name.startswith('\\\\?\\'):
+            name = name.replace('\\\\?\\', '')
+
+        if name.endswith(':'):
+            name += '\\'
+
+        dm = emu.get_drive_manager()
+        return dm.get_drive_type(name)
 
     @apihook('GetExitCodeProcess', argc=2)
     def GetExitCodeProcess(self, emu, argv, ctx={}):
@@ -4505,3 +4729,406 @@ class Kernel32(api.ApiHandler):
         lpFrequency = argv[0]
         self.mem_write(lpFrequency, (10000000).to_bytes(8, 'little'))
         return 1
+
+    @apihook('FindFirstVolume', argc=2)
+    def FindFirstVolume(self, emu, argv, ctx={}):
+        """
+        HANDLE FindFirstVolumeW(
+          LPWSTR lpszVolumeName,
+          DWORD  cchBufferLength
+        );
+        """
+        lpszVolumeName, _ = argv
+
+        cw = self.get_char_width(ctx)
+
+        dm = emu.get_drive_manager()
+        dw = dm.walk_drives()
+        hnd = self.get_handle()
+        self.find_volumes.update({hnd: {"walker": dw}})
+
+        # Each drive contains a single volume
+        curr_drive = next(dw)
+        if curr_drive:
+            volume_guid_path = curr_drive.get('volume_guid_path')
+            argv[0] = volume_guid_path
+
+            self.write_mem_string(volume_guid_path + '\x00', lpszVolumeName, cw)
+
+        return hnd
+
+    @apihook('FindNextVolume', argc=3)
+    def FindNextVolume(self, emu, argv, ctx={}):
+        """
+        BOOL FindNextVolumeW(
+          HANDLE hFindVolume,
+          LPWSTR lpszVolumeName,
+          DWORD  cchBufferLength
+        );
+        """
+        hFindVolume, lpszVolumeName, cchBufferLength = argv
+
+        cw = self.get_char_width(ctx)
+
+        dsearch = self.find_volumes.get(hFindVolume)
+        if not hFindVolume or not dsearch:
+            return 0
+
+        # Get next drive; each drive contains one volume
+        walker = dsearch.get('walker')
+        try:
+            next_drive = next(walker)
+        except StopIteration:
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
+            return 0
+
+        volume_guid_path = next_drive.get('volume_guid_path')
+        argv[1] = volume_guid_path
+        self.write_mem_string(volume_guid_path + '\x00', lpszVolumeName, cw)
+
+        return 1
+
+    @apihook('FindVolumeClose', argc=1)
+    def FindVolumeClose(self, emu, argv, ctx={}):
+        """
+        BOOL FindVolumeClose(
+          HANDLE hFindVolume
+        );
+        """
+        hFindVolume, = argv
+
+        try:
+            self.find_volumes.pop(hFindVolume)
+        except KeyError:
+            return 0
+
+        return 1
+
+    @apihook('CreateIoCompletionPort', argc=4)
+    def CreateIoCompletionPort(self, emu, argv, ctx={}):
+        """
+        HANDLE WINAPI CreateIoCompletionPort(
+          _In_     HANDLE    FileHandle,
+          _In_opt_ HANDLE    ExistingCompletionPort,
+          _In_     ULONG_PTR CompletionKey,
+          _In_     DWORD     NumberOfConcurrentThreads
+        );
+        """
+        FileHandle, ExistingCompletionPort, CompletionKey, \
+            NumberOfConcurrentThreads = argv
+
+        # TODO: Implement completion port creation
+        hnd = self.get_handle()
+
+        return hnd
+
+    @apihook('GetVolumePathNamesForVolumeName', argc=4)
+    def GetVolumePathNamesForVolumeName(self, emu, argv, ctx={}):
+        """
+        BOOL GetVolumePathNamesForVolumeNameW(
+          LPCWSTR lpszVolumeName,
+          LPWCH   lpszVolumePathNames,
+          DWORD   cchBufferLength,
+          PDWORD  lpcchReturnLength
+        );
+        """
+        lpszVolumeName, lpszVolumePathNames, cchBufferLength, \
+            lpcchReturnLength = argv
+
+        cw = self.get_char_width(ctx)
+
+        volume_guid_path = self.read_mem_string(lpszVolumeName, cw)
+        if volume_guid_path:
+            argv[0] = volume_guid_path
+
+        dm = emu.get_drive_manager()
+        drive = dm.get_drive(volume_guid_path=volume_guid_path)
+        if drive:
+            root_path = drive.get('root_path')
+            argv[1] = root_path
+            root_path += '\x00\x00'  # additional NULL to terminate list
+
+            root_path_len = len(root_path)
+            argv[3] = root_path_len
+
+            self.write_mem_string(root_path, lpszVolumePathNames, cw)
+            self.mem_write(lpcchReturnLength,
+                           root_path_len.to_bytes(4, 'little'))
+
+        return 1
+
+    @apihook('GetLogicalDrives', argc=0)
+    def GetLogicalDrives(self, emu, argv, ctx={}):
+        """
+        DWORD GetLogicalDrives();
+        """
+        dm = emu.get_drive_manager()
+        rv = 0
+        for i, dl in enumerate(string.ascii_uppercase):
+            if dl in dm.drive_letters:
+                rv |= (1 << i)
+
+        return rv
+
+    @apihook('GlobalMemoryStatus', argc=1)
+    def GlobalMemoryStatus(self, emu, argv, ctx={}):
+        """
+        void GlobalMemoryStatus(
+        LPMEMORYSTATUS lpBuffer
+        );
+        """
+        return
+
+    @apihook('GetDiskFreeSpaceEx', argc=4)
+    def GetDiskFreeSpaceEx(self, emu, argv, ctx={}):
+        """
+        BOOL GetDiskFreeSpaceEx(
+        LPCSTR          lpDirectoryName,
+        PULARGE_INTEGER lpFreeBytesAvailableToCaller,
+        PULARGE_INTEGER lpTotalNumberOfBytes,
+        PULARGE_INTEGER lpTotalNumberOfFreeBytes
+        );
+        """
+        return True
+
+    @apihook('GetSystemDefaultLangID', argc=0)
+    def GetSystemDefaultLangID(self, emu, argv, ctx={}):
+        """
+        LANGID GetSystemDefaultLangID();
+        """
+        return True
+
+    @apihook('ResetEvent', argc=1)
+    def ResetEvent(self, emu, argv, ctx={}):
+        """
+        BOOL ResetEvent(
+        HANDLE hEvent
+        );
+        """
+        return True
+
+    @apihook('WaitForMultipleObjects', argc=4)
+    def WaitForMultipleObjects(self, emu, argv, ctx={}):
+        """
+        DWORD WaitForMultipleObjects(
+        DWORD        nCount,
+        const HANDLE *lpHandles,
+        BOOL         bWaitAll,
+        DWORD        dwMilliseconds
+        );
+        """
+        return 0
+
+    @apihook('GetComputerNameEx', argc=3)
+    def GetComputerNameEx(self, emu, argv, ctx={}):
+        """
+        BOOL GetComputerNameExA(
+          COMPUTER_NAME_FORMAT NameType,
+          LPSTR                lpBuffer,
+          LPDWORD              nSize
+        );
+        """
+        NameType, lpBuffer, nSize = argv
+
+        cw = self.get_char_width(ctx)
+
+        name_type = k32types.get_define(NameType, prefix='ComputerName')
+        if name_type:
+            argv[0] = name_type
+
+        hostname = emu.get_hostname()
+        argv[1] = hostname
+
+        hostname_len = len(hostname)
+        argv[2] = hostname_len
+
+        self.write_mem_string(hostname, lpBuffer, cw)
+        self.mem_write(nSize, hostname_len.to_bytes(4, 'little'))
+
+        return 1
+
+    @apihook('GetDateFormat', argc=6)
+    def GetDateFormat(self, emu, argv, ctx={}):
+        """
+        int GetDateFormatA(
+          LCID             Locale,
+          DWORD            dwFlags,
+          const SYSTEMTIME *lpDate,
+          LPCSTR           lpFormat,
+          LPSTR            lpDateStr,
+          int              cchDate
+        );
+        """
+        Locale, dwFlags, lpDate, lpFormat, lpDateStr, cchDate = argv
+
+        cw = self.get_char_width(ctx)
+
+        locale = k32types.get_define(Locale, prefix='LOCALE_')
+        if locale:
+            argv[0] = locale
+
+        if lpDate == 0:
+            self.GetSystemTimeAsFileTime(emu, [lpDate], ctx)
+
+        sys_time = self.k32types.SYSTEMTIME(emu.get_ptr_size())
+        sys_time = self.mem_cast(sys_time, lpDate)
+
+        date_format = self.read_mem_string(lpFormat, cw)
+        if date_format:
+            argv[3] = date_format
+
+        # Working from example "ddd, dd MMM yyyy "; TODO: expand this
+        date = datetime.date(sys_time.wYear, sys_time.wMonth, sys_time.wDay)
+        date_format = date_format.replace('ddd', '%a')
+        date_format = date_format.replace('dd', '%d')
+        date_format = date_format.replace('MMM', '%b')
+        date_format = date_format.replace('yyyy', '%Y')
+
+        try:
+            date_str = date.strftime(date_format)
+        except Exception:
+            return 0
+        else:
+            if cchDate == 0:
+                return len(date_str) + 1
+
+            self.write_mem_string(date_str + '\x00' * cw, lpDateStr, cw)
+            argv[4] = date_str
+
+        return 1
+
+    @apihook('DeviceIoControl', argc=8)
+    def DeviceIoControl(self, emu, argv, ctx={}):
+        """
+        BOOL DeviceIoControl(
+            HANDLE       hDevice,
+            DWORD        dwIoControlCode,
+            LPVOID       lpInBuffer,
+            DWORD        nInBufferSize,
+            LPVOID       lpOutBuffer,
+            DWORD        nOutBufferSize,
+            LPDWORD      lpBytesReturned,
+            LPOVERLAPPED lpOverlapped
+        );
+        """
+        hnd, ioctl, InputBuffer, in_len, out_buf, out_len, bytes_ret, overlap = argv # noqa
+        nts = ddk.STATUS_SUCCESS
+
+        obj = self.get_object_from_handle(hnd)
+
+        in_buf = b''
+        if InputBuffer:
+            in_buf = self.mem_read(InputBuffer, in_len)
+
+        nts, outbuf = emu.dev_ioctl(emu.get_ptr_size(), obj, ioctl, in_buf)
+
+        if out_buf:
+            if out_len < len(outbuf):
+                nts = ddk.STATUS_BUFFER_TOO_SMALL
+            else:
+                self.mem_write(out_buf, outbuf)
+        return nts
+
+    @apihook('GetTimeFormat', argc=6)
+    def GetTimeFormat(self, emu, argv, ctx={}):
+        """
+        int GetTimeFormatA(
+          LCID             Locale,
+          DWORD            dwFlags,
+          const SYSTEMTIME *lpTime,
+          LPCSTR           lpFormat,
+          LPSTR            lpTimeStr,
+          int              cchTime
+        );
+        """
+        Locale, dwFlags, lpTime, lpFormat, lpTimeStr, cchTime = argv
+
+        cw = self.get_char_width(ctx)
+
+        locale = k32types.get_define(Locale, prefix='LOCALE_')
+        if locale:
+            argv[0] = locale
+
+        if lpTime == 0:
+            self.GetSystemTimeAsFileTime(emu, [lpTime], ctx)
+
+        sys_time = self.k32types.SYSTEMTIME(emu.get_ptr_size())
+        sys_time = self.mem_cast(sys_time, lpTime)
+
+        if lpFormat:
+            time_format = self.read_mem_string(lpFormat, cw)
+            if time_format:
+                argv[3] = time_format
+        else:
+            # Using this as default; TODO: use proper string based on locale
+            time_format = 'hh:mm:ss'
+
+        # Working from "hh:mm:ss"; TODO: expand this
+        t = datetime.time(hour=sys_time.wHour,
+                          minute=sys_time.wMinute,
+                          second=sys_time.wSecond)
+        time_format = time_format.replace('hh', '%I')
+        time_format = time_format.replace('HH', '%H')
+        time_format = time_format.replace('mm', '%M')
+        time_format = time_format.replace('ss', '%S')
+
+        try:
+            time_str = t.strftime(time_format)
+        except Exception:
+            return 0
+        else:
+            if cchTime == 0:
+                return len(time_str) + 1
+
+            self.write_mem_string(time_str + '\x00' * cw, lpTimeStr, cw)
+            argv[4] = time_str
+
+        return 1
+
+    @apihook('FlushFileBuffers', argc=1)
+    def FlushFileBuffers(self, emu, argv, ctx={}):
+        '''BOOL FlushFileBuffers(
+        HANDLE hFile
+        );'''
+
+        hFile = argv
+        rv = 1
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+
+        return rv
+
+    @apihook('InitializeConditionVariable', argc=1)
+    def InitializeConditionVariable(self, emu, argv, ctx={}):
+        '''
+        void InitializeConditionVariable(
+        PCONDITION_VARIABLE ConditionVariable
+        );
+        '''
+        ConditionVariable = argv
+        rv = 0
+
+        return rv
+
+    @apihook('Wow64DisableWow64FsRedirection', argc=1)
+    def Wow64DisableWow64FsRedirection(self, emu, argv, ctx={}):
+        '''
+        BOOL Wow64DisableWow64FsRedirection(
+          PVOID *OldValue
+        );
+        '''
+        OldValue = argv
+        rv = 1
+
+        return rv
+
+    @apihook('Wow64RevertWow64FsRedirection', argc=1)
+    def Wow64RevertWow64FsRedirection(self, emu, argv, ctx={}):
+        '''
+        BOOL Wow64RevertWow64FsRedirection(
+          PVOID OlValue
+        );
+        '''
+        OlValue = argv
+        rv = 1
+
+        return rv
